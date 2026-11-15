@@ -145,6 +145,17 @@ type DailyTokenBucket struct {
 	CacheReadTokens int    `json:"cache_read_tokens"`
 }
 
+// hasLLMUsageTable reports whether the llm_usage ledger exists in this database.
+// It is created by the server manager rather than by schema migration, so db-only
+// callers must tolerate its absence.
+func (d *DB) hasLLMUsageTable() (bool, error) {
+	var exists bool
+	if err := d.QueryRow(`SELECT to_regclass('llm_usage') IS NOT NULL`).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
 // TokenDailyAll aggregates token consumption by calendar day (UTC) for the
 // past `days` days across all explorations. Only kind='result' rows carry token
 // counts (the terminal per-run summary), so there is no double-counting.
@@ -161,9 +172,45 @@ type DailyTokenBucket struct {
 // `input - cache_read` then collapses to ~0. LEAST() keeps the value a valid
 // subset of input, and COALESCE preserves the activity value for any bucket
 // the ledger does not cover.
+//
+// The ledger table is created by the server manager (EnsureLLMUsageTable), not
+// by schema migration, so it can legitimately be absent — a fresh database, or
+// a db-only caller such as a test. The guard keeps this aggregate working in
+// that case and falls back to the activity rollup.
 func (d *DB) TokenDailyAll(days int) ([]DailyTokenBucket, error) {
 	if days <= 0 {
 		days = 30
+	}
+	// llm_usage is created by the server manager, not by schema migration, so it
+	// can legitimately be absent (fresh database, or a db-only caller such as a
+	// test). Referencing it unconditionally would fail the whole aggregate, so
+	// the ledger join is only added when the table is actually there.
+	hasLedger, err := d.hasLLMUsageTable()
+	if err != nil {
+		return nil, err
+	}
+	ledgerCTE, ledgerJoin, cacheExpr := "", "", "legacy.cache_read_tokens"
+	if hasLedger {
+		ledgerCTE = `, ledger AS (
+			SELECT TO_CHAR(DATE_TRUNC('day', ts AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
+			       exploration_id,
+			       COALESCE(SUM(input_tokens), 0) AS input_tokens,
+			       COALESCE(SUM(cache_read), 0) AS cache_read
+			FROM llm_usage
+			WHERE exploration_id IS NOT NULL
+			  AND ts >= NOW() - ($1 * INTERVAL '1 day')
+			GROUP BY day, exploration_id
+		)`
+		ledgerJoin = "LEFT JOIN ledger USING (day, exploration_id)"
+		// Apply the ledger's cache-hit RATIO for this exploration/day to the
+		// legacy input total. Clamping with LEAST() alone would pin every bucket
+		// the ledger covers more input for to a fictitious 100% hit.
+		cacheExpr = `CASE
+		         WHEN ledger.input_tokens > 0
+		           THEN LEAST(legacy.input_tokens::numeric,
+		                      legacy.input_tokens::numeric * ledger.cache_read / ledger.input_tokens)
+		         ELSE legacy.cache_read_tokens
+		       END::bigint`
 	}
 	rows, err := d.Query(`
 		WITH legacy AS (
@@ -176,31 +223,14 @@ func (d *DB) TokenDailyAll(days int) ([]DailyTokenBucket, error) {
 			WHERE kind = 'result'
 			  AND created_at >= NOW() - ($1 * INTERVAL '1 day')
 			GROUP BY day, exploration_id
-		), ledger AS (
-			SELECT TO_CHAR(DATE_TRUNC('day', ts AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
-			       exploration_id,
-			       COALESCE(SUM(input_tokens), 0) AS input_tokens,
-			       COALESCE(SUM(cache_read), 0) AS cache_read
-			FROM llm_usage
-			WHERE exploration_id IS NOT NULL
-			  AND ts >= NOW() - ($1 * INTERVAL '1 day')
-			GROUP BY day, exploration_id
-		)
+		)`+ledgerCTE+`
 		SELECT legacy.day,
 		       legacy.exploration_id,
 		       legacy.input_tokens,
 		       legacy.output_tokens,
-		       -- Apply the ledger's cache-hit RATIO for this exploration/day to the
-		       -- legacy input total. Clamping with LEAST() instead would pin every
-		       -- bucket the ledger covers more input for to a fictitious 100% hit.
-		       CASE
-		         WHEN ledger.input_tokens > 0
-		           THEN LEAST(legacy.input_tokens::numeric,
-		                      legacy.input_tokens::numeric * ledger.cache_read / ledger.input_tokens)
-		         ELSE legacy.cache_read_tokens
-		       END::bigint
+		       `+cacheExpr+`
 		FROM legacy
-		LEFT JOIN ledger USING (day, exploration_id)
+		`+ledgerJoin+`
 		ORDER BY legacy.day`, days)
 	if err != nil {
 		return nil, err

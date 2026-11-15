@@ -342,7 +342,14 @@ func TestTokenDailyAllBucketsByActivityTimeNotTaskCreation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	byDay := dailyTokenBuckets(buckets)
+	// Other tests share this database, so keep only this exploration's rows.
+	own := make([]DailyTokenBucket, 0, len(buckets))
+	for _, b := range buckets {
+		if b.ExplorationID == expID {
+			own = append(own, b)
+		}
+	}
+	byDay := dailyTokenBuckets(own)
 
 	older := byDay[dayOf(3).Format(time.DateOnly)]
 	if older.InputTokens != 100 {
@@ -352,11 +359,7 @@ func TestTokenDailyAllBucketsByActivityTimeNotTaskCreation(t *testing.T) {
 	if newer.InputTokens != 250 {
 		t.Fatalf("day-1 input=%d, want 250", newer.InputTokens)
 	}
-
-	// Each row must carry its exploration so the dashboard can filter by profile.
-	for _, b := range buckets {
-		if b.ExplorationID != expID {
-			t.Fatalf("bucket %s exploration_id=%d, want %d", b.Day, b.ExplorationID, expID)
-		}
+	if len(own) != 2 {
+		t.Fatalf("got %d buckets for exploration %d, want 2", len(own), expID)
 	}
 }
